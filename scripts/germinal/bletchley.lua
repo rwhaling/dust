@@ -3,13 +3,27 @@
 -- with or without grid, midi capable
 --
 -- enc1: bpm
--- enc2: pulse division (24ppqn base, default 2)
+-- enc2: pulse division
 -- enc3: voice 1 trigger probability
 -- key2: start/stop
--- key3: next UI page
+-- key3: next UI page (0/1)
 -- 
 -- voices default to midi channels 1 and 2
 -- (use 3 and 4 for cvpal)
+-- 
+-- GRID UI
+-- PAGE 0:
+-- Each column denotes a step in the register (1-16)
+-- Each row is a possible value of the register (1-8)
+--
+-- PAGE 1:
+-- Top 3 rows denote shift registers in binary 
+-- Same # of registers, same # of possible values
+-- Row 4: Voice 1 Probability (1-8) Voice 2 Probability (9-16)
+-- Row 5: Loop length (1-16)
+-- Row 6: Voice 1 Octave Range (1-4) Register Change Chance (5-12) Voice 2 Octave Range (13-16)
+-- Row 7: Voice 1 Pitch Offset (1-8) Voice 2 Pitch Offset (9-16)
+-- Row 8: Key/Root Select (Circle of 5ths) (1-12) Scale Select (13-14) Start/Stop (16)
 
 beatclock = require 'beatclock'
 
@@ -20,9 +34,11 @@ end
 
 local page = 1
 
+-- default per-voice settings for custom hacking
 local voices = {
-  {channel=3, range=2, offset=35, prob=8, accum=1, accumulator=0, gate_time=0.35, off_metro=metro.alloc()},
-  {channel=4, range=3, offset=35, prob=1, accum=1, accumulator=0, gate_time=0.35, off_metro=metro.alloc()}
+  -- switch to 3/4 for CVpal
+  {channel=1, range=2, offset=35, prob=8, accum=1, accumulator=0, gate_time=0.35, off_metro=metro.alloc()},
+  {channel=2, range=3, offset=35, prob=1, accum=1, accumulator=0, gate_time=0.35, off_metro=metro.alloc()}
 }
 
 local clock_divide = 2
@@ -39,12 +55,12 @@ local pulse_on = metro.alloc()
 pulse_on.time = 0.1
 pulse_on.count = -1
 
+-- since I'm only dealing with triggers note-off is mostly untested
 local pulse_off = metro.alloc()
 pulse_off.time = 0.35
 pulse_off.count = 1
 
-local factor = 0
-local factor_cutoff = 5
+local chance = 5
 
 local loop_length = 5
 
@@ -59,6 +75,8 @@ for l = 1,#circle_of_fifths do
   circle_of_fifths_labels[l] = circle_of_fifths[l].name
 end
 
+-- my scaling logic is kind of weak but this works
+-- note that each scale starts with 0 and ends with 12
 local scales = {
   {name="CHROMATIC", scale={0,1,2,3,4,5,6,7,8,9,10,11, 12}},
   {name="DIATONIC", scale={0,2,4,5,7,9,11, 12}},
@@ -73,6 +91,7 @@ for s = 1, #scales do
   scale_labels[s] = scales[s].name
 end
 
+-- 8 levels of trigger probability (all are *  1/16)
 local trigger_prob_table = {
   0,
   1,
@@ -84,10 +103,13 @@ local trigger_prob_table = {
   16
 }
 
+-- nominal octave range levels 
+-- since the algorithm is center-biased they don't sound this wide
 local range_options = {
   2,3,4,5
 }
 
+-- base midi note - should offer an additional tweakable param
 local offset_options = {
   12,24,36,42,48,54,60,66,72
 }
@@ -99,18 +121,6 @@ local registers = {}
 for i = 1,MAX_STEP do
   registers[i] = 1
 end
-
--- default values for unselected grid cells in page
-local g_default_exp = {
-  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
-  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
-  {0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0},
-  {1,2,3,4,5,6,7,8,1,2,3,4,5,6,7,8},
-  {1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8},
-  {2,3,4,5,0,0,0,0,0,0,0,0,2,3,4,5},
-  {2,3,4,5,6,7,8,9,2,3,4,5,6,7,8,9},
-  {2,2,2,2,2,2,2,2,2,2,2,2,6,6,0,5}
-}
 
 -- simple quantizer, could use some love
 function to_scale(raw_n)
@@ -196,7 +206,7 @@ function redraw_grid_page1()
   for i=1,MAX_STEP do
     -- row 1 - high bit - value of 4
     if hi_bit(r[i]) == 1 then
-      g.led(i, 1, 6)
+      g.led(i, 1, 4)
     elseif next_step == i then
       g.led(i, 1, 2)
     else 
@@ -205,7 +215,7 @@ function redraw_grid_page1()
     
     -- row 2 - middle bit - value of 2
     if mid_bit(r[i]) == 1 then
-      g.led(i, 2, 6)
+      g.led(i, 2, 4)
     elseif next_step == i then
       g.led(i, 2, 2)
     else 
@@ -214,7 +224,7 @@ function redraw_grid_page1()
 
     -- row 3 - low bit - value of 1
     if lo_bit(r[i]) == 1 then
-      g.led(i, 3, 6)
+      g.led(i, 3, 4)
     elseif next_step == i then
       g.led(i, 3, 2)
     else
@@ -224,47 +234,70 @@ function redraw_grid_page1()
     for j=4,8 do
       -- row 4 - trigger prob voice 1/2
       if j == 4 then
-        if (i < 9) and ( i == voices[1].prob) then
-            g.led(i,j,15)
-        elseif ( (i - 8) == voices[2].prob) then
-            g.led(i,j,15)
+        if (i < 9) and ( i < voices[1].prob) then
+            g.led(i,j,2)
+        elseif (i < 9) and ( i == voices[1].prob) then
+            g.led(i,j,4)
+        elseif (i >= 9) and ( (i - 8) < voices[2].prob) then
+            g.led(i,j,2)
+        elseif (i >= 9) and ( (i - 8) == voices[2].prob) then
+            g.led(i,j,4)
         else
-            g.led(i,j,g_default_exp[j][i])        
+            g.led(i,j,0)        
         end
       -- row 5 - loop length
       elseif j == 5 then
-        if i == loop_length then
-          g.led(i,j,15)
+        if i < loop_length then
+          g.led(i,j,2)
+        elseif i == loop_length then
+          g.led(i,j,4)
         else
-          g.led(i,j,g_default_exp[j][i])
+          g.led(i,j,0)
         end
       -- row 6 -- voice 1 range / chance / voice 2 range
       elseif j == 6  then
-        if i < 5 and ( i == params:get("voice_1_pitch_range")) then
-          g.led(i,j,15)
-        elseif i >= 5 and i < 12 and (factor_cutoff == (i - 4)) then
-          g.led(i,j,15)
-        elseif i >= 13 and ( i - 12 == params:get("voice_2_pitch_range")) then
-          g.led(i,j,15)
+        if i < 5 and ( i < params:get("voice_1_pitch_range")) then
+          g.led(i,j,2)
+        elseif i < 5 and ( i == params:get("voice_1_pitch_range")) then
+          g.led(i,j,4)
+        elseif i < 5 then
+          g.led(i,j,0)
+        elseif i >= 5 and i <= 12 and ((i - 4) < chance) then
+          g.led(i,j,2)
+        elseif i >= 5 and i <= 12 and (chance == (i - 4)) then
+          g.led(i,j,4)
+        elseif i >= 13 and ( (i - 12) < params:get("voice_2_pitch_range")) then
+          g.led(i,j,2)
+        elseif i >= 13 and ( (i - 12) == params:get("voice_2_pitch_range")) then
+          g.led(i,j,4)
         else
-          g.led(i,j,g_default_exp[j][i])        
-          
+          g.led(i,j,0)        
         end
       -- row 7 -- voice 1 offset / voice 2 offset
       elseif j == 7 then
-        if (i < 9) and ( i == params:get("voice_1_pitch_offset")) then
-          g.led(i,j,15)
-        elseif ( (i - 8) == params:get("voice_2_pitch_offset")) then
-          g.led(i,j,15)
+        if (i < 9) and ( i < params:get("voice_1_pitch_offset")) then
+          g.led(i,j,2)
+        elseif (i < 9) and ( i == params:get("voice_1_pitch_offset")) then
+          g.led(i,j,4)
+        elseif i >= 9 and ( (i - 8) < params:get("voice_2_pitch_offset")) then
+          g.led(i,j,2)
+        elseif i >= 9 and ( (i - 8) == params:get("voice_2_pitch_offset")) then
+          g.led(i,j,4)
         else
-          g.led(i,j,g_default_exp[j][i])        
+          g.led(i,j,0)        
         end
       -- row 8 -- key (circle of fifths) / scale / start/stop
       elseif j == 8 then
-        if (i) == params:get("root") then
-          g.led(i,j,6)
-        else
-          g.led(i,j,g_default_exp[j][i])
+        if i <= 12 and i == params:get("root") then
+          g.led(i,j,4)
+        elseif i <= 12 then
+          g.led(i,j,2)
+        elseif i <= 14 then
+          g.led(i,j,4)
+        elseif i == 15 then
+          g.led(i,j,0)
+        elseif i == 16 then
+          g.led(i,j,4)
         end
       else 
         g.led(i,j,g_default_exp[j][i])
@@ -291,9 +324,7 @@ end
 
 function g_event_page1(x,y,z)
   print("grid - x: " .. x .. " y: " .. y .. " z: " .. z .. " VALUE: " .. 9 - y)
-  if x == 16 and y == 8 and z == 1 then
-    toggle_clock()
-  elseif y == 1 and z == 1 then
+  if y == 1 and z == 1 then
     if hi_bit(registers[x]) == 1 then
       registers[x] = registers[x] - 4
     else
@@ -329,6 +360,12 @@ function g_event_page1(x,y,z)
     params:set("voice_2_pitch_offset", x - 8)
   elseif y == 8 and z == 1 and x < 13 then
     params:set("root", x)
+  elseif y == 8 and z == 1 and x == 13 then
+    params:delta("scale",-1)
+  elseif y == 8 and z == 1 and x == 14 then
+    params:delta("scale",1)
+  elseif y == 8 and z == 1 and x == 16 then
+    toggle_clock()
   end
   redraw()
   redraw_grid()
@@ -357,7 +394,7 @@ function init()
 
   pulse_on.callback = on_pulse
   params:add_number("chance","chance",1,8,5)
-  params:set_action("chance", function(x) factor_cutoff = x end)
+  params:set_action("chance", function(x) chance = x end)
 
   params:add_number("loop_length", "loop_length",1,16,5)
   params:set_action("loop_length", function(x) loop_length = x end)
@@ -458,7 +495,7 @@ function make_next_note()
   end
   
   chance_random = math.random(8)
-  if chance_random > factor_cutoff then
+  if chance_random <= chance then
     registers[next_step] = math.random(8)
   else
     registers[next_step] = registers[loop_step]
